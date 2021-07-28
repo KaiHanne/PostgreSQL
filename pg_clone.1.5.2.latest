@@ -1,0 +1,578 @@
+#!/bin/bash
+# ==============================================================================
+#
+#     File: pg_clone 
+#     Date: Wed Feb  1 16:07:58 CET 2017
+#     What: create a postgres clone cluster with pg_basebackup 
+#      Who: Gert J. Willems I&A/RAS/DBB
+#
+# Dependencies:
+#    - pg_basebackup
+#    - $HOME/lib/libbash.sh, used functions:
+#           * out
+#           * error_handler
+#           * init_mgs
+#
+# Synopsis:
+#
+# ------------------------------------------------------------------------------ 
+#
+#             Copyright (c) 2017 Provincie Gelderland I&A/RAS/DBB
+#             mailto: DBB@Gelderland.nl
+#
+# ==============================================================================
+# History:
+# Date       Rev   Author        What
+# ---------- ----- ------------- -----------------------------------------------
+# 01-02-2017 0.1   gjwillems     created
+# 13-02-2017 0.2.0 gjwillems     basic steps added
+# 21-03-2017 0.3.0 gjwillems     post clone actions added execution based on
+#                                configuration file variables
+# 22-03-2017 0.4.0 gjwillems     added post config only option to cl parser
+# 22-03-2017 0.5.0 gjwillems     added post processing to revoke
+#                                - default privs
+#                                - normal privs
+# 29-03-2017 0.6.0 gjwillems     improved and uptodate help
+# 29-03-2017 0.7.0 gjwillems     source instance specification added 
+#                                -s <instance-name/VIP>[,port]
+# 13-04-2017 0.8.0 gjwillems     conditionally check database(s) to be dropped
+# 08-06-2017 0.9.0 gjwillems     syslog message added in case of error to be
+#                                detected by the check_mk logwatch plugin
+# 13-06-2017 1.0.0 gjwillems     password reset for RESET_PASSWORD list added
+# 07-11-2017 1.1.0 gjwillems     new global/local setup implemented; improved
+#                                messaging, noexec handling a.o.
+# 30-01-2020 1.2.0 gjwillems     checkmk support added: write start, end and 
+#                                elapsed time of pg_basebackup
+# 25-02-2020 1.2.1 gjwillems     eerste branch op de global pg_clone specifiek
+#                                voor de ux63 geo_admin omgeving.
+#                                deze is later toegevoegd dan 1.3.1!!!
+# 20-02-2020 1.3.1 gjwillems     The use of cnames added for the local target
+#                                instance.
+# 12-08-2020 1.4.1 gjwillems     save_crts function added to restore the server 
+#                                certificate files
+# 19-01-2021 1.4.2 gjwillems     Centos 7/8 branch with the use of systemctl
+#                                instead of init.d and pg_ctl.
+# 11-02-2021 1.5.2 gjwillems     pgbaseversion added to som vars
+#
+# ==============================================================================
+# set -xv
+mod=$(basename $0)
+rev="1.5.2"
+rev_date="Thu Feb 11 14:47:08 CET 2021"
+
+time2wait=60                          # sleeptime for shutdown/startup actions
+PPCS_ONLY=0                           # Post Process Clone Steps only
+NOEXEC=0
+HOME=~postgres
+GLOBAL_HOME=${HOME}/global
+LOGGING=1
+LOGFILE="${HOME}/log/${mod}.log"
+redir=${GLOBAL_HOME}/bin/redirect.pl
+
+checkmk_info="/var/tmp/pg_clone.checkmk"
+
+noexec_msg="noexec, dry-run, returning to caller."
+
+source ${GLOBAL_HOME}/lib/libbash.sh
+source ${GLOBAL_HOME}/lib/libpostgres.sh
+
+pgbaseversion=$(pgversion -b)
+
+PATH=/usr/pgsql-${pgbaseversion}/bin:${PATH}
+_self_=${HOME}/global/bin/${mod}
+
+# ============================================================================== 
+# usage notes for pg_clone
+# ------------------------------------------------------------------------------ 
+function usage () {
+   cat << EOH
+   
+   ${mod} version ${rev} built ${rev_date}
+
+   $mod is used to built a PostgreSQl instance clone. The parameters for the 
+   post processing actions are, among others, located in pg_clone-<instance>.conf 
+   file. 
+   These are the current keywords:
+   - DROP_DATABASES  list of databases to drop
+   - DATABASE        primary database where schemas are dropped/created etc.
+   - DROP_ROLES      accounts and roles to remove
+   - REVOKE_PRIVS    privileges that should be revoked from roles
+
+   mandatory switches:
+   -s   source instance-name (cname[,port]) 
+   -t   target instance-name 
+
+   options:
+   -h	this usage screen
+   -n	noexecution mode, just show what would be done
+   -q   quiet processing 
+   -L   list the backup label fo the last backup
+   -f   force, do not check return statusses
+   -p   post processing steps only
+
+
+   Copyright (c) 2017 Provincie Gelderland I&A/RAS/DBB
+   mailto: DBB@Gelderland.nl
+
+
+EOH
+   exit 1
+}
+
+# ============================================================================== 
+# drop roles routine 
+# ------------------------------------------------------------------------------ 
+function drop_roles () {
+   out "remove accounts/roles from instance ${target_instance}"
+   
+   [[ ${NOEXEC} -eq 1 ]] && out "${noexec_msg}" && return
+
+   for role in $(printf "%s\n" "${DROP_ROLES}") 
+   do
+      # out "remove role ${role}"
+      psql ${DATABASE} -c "drop schema if exists ${role} cascade;" 2>&1 | ${redir}
+      psql ${DATABASE} -c "drop role if exists ${role};" 2>&1 | ${redir}
+   done
+   return
+}
+
+# ============================================================================== 
+# revoke default privs routine 
+# ------------------------------------------------------------------------------ 
+function revoke_default_privs () {
+   out "revoke default privs from roles for instance ${target_instance}"
+
+   [[ ${NOEXEC} -eq 1 ]] && out "${noexec_msg}" && return
+
+   query="SELECT DISTINCT 'alter default privileges for role '
+          || pg_catalog.pg_get_userbyid(d.defaclrole) || ' in schema '
+          || n.nspname 
+          ||' revoke all privileges on '||
+          CASE d.defaclobjtype
+             WHEN 'r' THEN 'tables'
+             WHEN 'S' THEN 'sequences'
+             WHEN 'f' THEN 'functions'
+          END ||' from ' || pg_catalog.pg_get_userbyid(d.defaclrole) ||' cascade ;'
+   FROM   pg_catalog.pg_default_acl d
+   LEFT 
+   JOIN   pg_catalog.pg_namespace n 
+   ON     n.oid = d.defaclnamespace
+   WHERE  substring( pg_catalog.array_to_string(d.defaclacl, E'\n') 
+             from position( '=' in  pg_catalog.array_to_string(d.defaclacl, E'\n') ) 
+             for 5) = '=arwd'
+   OR     substring( pg_catalog.array_to_string(d.defaclacl, E'\n') 
+             from position( '=' in  pg_catalog.array_to_string(d.defaclacl, E'\n') ) 
+             for 4) = '=rwU'
+   OR     substring( pg_catalog.array_to_string(d.defaclacl, E'\n') 
+             from position( '=' in  pg_catalog.array_to_string(d.defaclacl, E'\n') ) 
+             for 2) = '=X'
+   ;"
+   
+   psql ${DATABASE} -A -t -q -c "${query}" | while read line
+   do
+      r=$(psql ${DATABASE} -c "$line" | ${redir})
+      rd_out "${r} ${line}"
+   done
+   return
+}
+
+# ============================================================================== 
+# revoke privs routine 
+# ------------------------------------------------------------------------------ 
+function revoke_privs () {
+   role=${1}
+   out "revoke privs from role [${role}] for instance ${target_instance}"
+
+   [[ ${NOEXEC} -eq 1 ]] && out "${noexec_msg}" && return
+
+   query="SELECT DISTINCT 'revoke all privileges on all '||
+          CASE c.relkind 
+             WHEN 'r' THEN 'tables' 
+             WHEN 'S' THEN 'sequences' 
+          END  || ' in schema '|| n.nspname  || ' from ${role} ;'
+          FROM   pg_catalog.pg_class c
+          LEFT 
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE  c.relkind IN ('r', 'v', 'S', 'f')
+            AND  n.nspname !~ '^pg_' AND pg_catalog.pg_table_is_visible(c.oid)
+            AND  pg_catalog.array_to_string(c.relacl, E'\n') like '%${role}%'
+          ;"
+          
+   psql ${DATABASE} -A -t -q -c "${query}" | while read line
+   do
+      r=$(psql ${DATABASE} -c "$line" | ${redir})
+      rd_out "${r} ${line}"
+   done
+   return
+}
+
+# ============================================================================== 
+# drop databases routine 
+# ------------------------------------------------------------------------------ 
+function drop_databases () {
+   out "remove obsolete database(s) from instance ${target_instance}"
+
+   [[ ${NOEXEC} -eq 1 ]] && out "${noexec_msg}" && return
+
+   for database in $(printf "%s\n" "${DROP_DATABASES}") 
+   do
+      # out "drop database ${database}"
+      r=$(psql -c "drop database if exists ${database};" | ${redir})
+      rd_out "${r} ${role}" 
+   done
+   return
+}
+   
+# ============================================================================== 
+# check is post processing steps are succesfully executed
+# ------------------------------------------------------------------------------ 
+function chk_clone() {
+   dbnam="${1}"
+
+   query="SELECT d.datname 
+   FROM pg_catalog.pg_database d
+   WHERE d.datname = '${dbnam}';"
+   
+   r=$(psql -A -t -c "${query}" 2>/dev/null)
+   rv=${?}
+   printf "${r}"
+   return ${rv}
+}
+
+# ============================================================================== 
+# reset password function for RESET_PASSWORDS list
+# ------------------------------------------------------------------------------ 
+function reset_password() {
+    role=${1}
+    # dbnam="${1}"
+    pwd=$(echo $RANDOM$RANDOM$RANDOM$RANDOM | sha1sum | sed 's/  -//g')
+   
+    query="alter role ${role} with nologin password '${pwd}';"
+  
+    r=$(psql -c "$query")
+    rv=${?}
+    out "Reset password for role: ${r} ${role} [${pwd}]"
+    return ${rv}
+}
+
+# ============================================================================== 
+# checkmk info
+# ------------------------------------------------------------------------------ 
+function checkmk_info() {
+   local _self_="${FUNCNAME[0]}"
+   [[ ${NOEXEC} -eq 1 ]] && return
+   
+   [[ ${1} -eq 1 ]] && printf "# $(date) ${_self_}\n" > ${checkmk_info} \
+                    && printf "# start:end of pg_basebackup\n" >> ${checkmk_info}
+
+   timestamp=$(date +"%s")
+   printf "${timestamp}:" >> ${checkmk_info} 
+   
+   return
+}
+
+# ============================================================================== 
+# Save the server cerificate files 
+# ------------------------------------------------------------------------------ 
+function restore_crts() {
+   _self_=${FUNCNAME[0]}
+
+   declare -i Status
+
+   Status=0
+   KEY="wildcard_prvgld_nl.key"
+
+   ln -sf /etc/pki/ca-trust/source/anchors/wildcard_tot_2022-chain.pem ${PGDATA}
+   ln -sf /etc/pki/ca-trust/source/anchors/wildcard_prvgld_nl.cer ${PGDATA}
+   Status=$?
+
+   return ${Status}
+}
+
+
+# ====== parser ================================================================
+while getopts "pLhnqft:s:" argv
+do
+   case ${argv}
+   in
+
+      L) # list last backup
+         bl="${PGDATA}/backup_label"
+         if [ -s ${bl} ]; then
+            cat ${bl}
+         else
+            lmsg="File ${bl} not found."
+            out "${lmsg}"
+         fi
+         exit 0 ;;
+      h) usage ;;
+      n) NOEXEC=1 ;;
+      q) QUIET=1 ;;
+      f) force=1 ;;
+      t) target_instance=${OPTARG} 
+         export PGDATA=/data/${target_instance}/core-01 ;;
+      p) PPCS_ONLY=1 ;;
+      s) vip="${OPTARG}"
+         r=$(instr "${vip}" ",") 
+         if [ $r -eq 0 ]; then
+            source_instance=${vip}
+         else
+            source_instance=$(echo ${vip}|cut -d ',' -f 1)
+            source_port=$(echo ${vip}|cut -d ',' -f 2)
+         fi ;;
+   esac
+done
+
+# ====== main scope ============================================================
+# step 0 Check if this is the Offloading server and NOT the source instance
+# ------------------------------------------------------------------------------ 
+config=${_self_}-${target_instance}.conf
+
+[[ -z ${target_instance} ]] && error_handler "Postgres target instance not specified"
+[[ -z ${source_instance} ]] && error_handler "Postgres source instance not specified"
+[[ -s ${config} ]] && source ${config} && CFF=1
+[[ -z ${CFF} ]] && out "No configuration file found: [${config}] (no postprocessing steps)"
+
+sysctl_name="postgresql-${pgbaseversion}-${target_instance}.service"
+
+# ====== init   ======
+source ${GLOBAL_HOME}/bin/pgmenu ${target_instance}
+
+if [ ${PPCS_ONLY} -eq 0 ]; then
+   config_files="${PGDATA}/pg_hba.conf ${PGDATA}/postgresql.conf \
+   ${PGDATA}/postmaster.opts ${PGDATA}/pg_ident.conf"
+   
+   init_mgs
+   # printf "DEBUG >> NOEXEC= [${NOEXEC}]\n"
+   h=$(hr 100)
+   out "${h}"
+   out "START OF NEW CLONE SESSION [${target_instance}]"
+   out "${h}"
+   
+   out "Configuration:"
+   out "PGBASE => [${PGBASE}]"
+   out "PGDATA => [${PGDATA}]"
+   out "PGWAL  => [${PGWAL}]"
+   out "PGARCH => [${PGARCH}]"
+   out "PGPORT => [${PGPORT}]"
+
+   host=$(hostname -s)
+   out "Target server: [${TARGET_SERVER}] host: [${host}]"
+   lmsg=$(printf "${ERR99}" ${mod} [${_self_}] [${host}] [${TARGET_SERVER}] )
+   out "Start of PostgreSQL clone process on host [${host}]"
+   out "$mod version ${rev} built ${rev_date}"
+   [[ "${host}" != "${TARGET_SERVER}" ]] && error_handler "${lmsg}"
+   
+   # ==============================================================================
+   # step 1. stop the postgresql instance
+   # ------------------------------------------------------------------------------ 
+   lmsg="step 1: stopping instance [${target_instance}]"
+   out "${lmsg}"
+   # r=$(pg_ctl status | ${redir}) 
+   r=$(sudo systemctl status ${sysctl_name} | ${redir}) 
+   rd_out "${r}"
+   
+   if [ ${NOEXEC} -eq 0 ]; then
+      r=$(sudo systemctl stop ${sysctl_name} | ${redir} )
+      exit_status=$?
+      if [ ${force:-0} -eq 0 ]; then
+         if [ ${exit_status} -ne 0 ]; then
+            lmsg=$(printf "${ERR50}" ${mod} \
+                          "error in stopping postgres instance ${target_instance}")
+            error_handler "${lmsg}"
+         else
+            # lmsg="Stopping PostgreSQL: ${r}"
+            rd_out "${r}"
+         fi
+      else
+         lmsg="PostgreSQL could already be down, forced to proceed;"
+         out "${lmsg}"
+         rd_out "${r}"
+      fi
+   else
+      out "${noexec_msg}"
+   fi
+   
+   # ==============================================================================
+   # step 2. save configfiles
+   # ------------------------------------------------------------------------------ 
+   lmsg="step 2: saving the configuration files ${config_files:0:81}..."
+   out "${lmsg}"
+   
+   if [ ${NOEXEC} -eq 0 ]; then
+      backup_dir="${HOME}/${target_instance}"
+      [[ ! -d ${backup_dir} ]] && mkdir ${backup_dir} 
+      r=$(cp -av ${config_files} ${backup_dir}/ 2>/dev/null| ${redir})
+      [[ ! -s ${backup_dir}/postgresql.conf ]] && lmsg=$(printf "${ERR98}" ${mod} \
+      "step 2 saving config files") && error_handler "${lmsg}"
+      lmsg="${r}; files saved"
+      out "${lmsg}"
+   else
+      out "${noexec_msg}"
+   fi
+   
+   # ==============================================================================
+   # step 3. removing all files in $PGDATA and in data-01 of the instance
+   # ------------------------------------------------------------------------------ 
+   lmsg="step 3: removing all instance files in ${PGDATA}, ${PGXLOG} and \
+   ${PGBASE}/data-01"
+   out "${lmsg}"
+   
+   if [ ${NOEXEC} -eq 0 ]; then
+      for dir in ${PGDATA} ${PGXLOG} ${PGBASE}/data-01
+      do
+         # printf "DEBUG >> removing [${dir}]\n" 
+         rm -rf ${dir} 2>/dev/null
+      done
+   else
+      out "${noexec_msg}"
+   fi
+   
+   # ==============================================================================
+   # step 4. create the base backup of the sourcde instance
+   # ------------------------------------------------------------------------------ 
+   lmsg="step 4: create the base backup of server ${source_instance} (instance) \
+   running on port ${source_port}"
+   out "${lmsg}"
+   lmsg="pg_basebackup --progress --host=${source_instance} --port=${source_port} \
+ --username=replication --pgdata=${PGDATA} --format=p \
+ --label=GEO_ADMIN_CLONE"
+   out "${lmsg}"
+   
+   checkmk_info 1
+
+   if [ ${NOEXEC} -eq 0 ]; then
+      lmsg="Starting PostgreSQL base backup"
+      out "${lmsg}"
+   
+      # no progress for batsh processing (cron)
+      # --progress \
+   
+      pg_basebackup --host=${source_instance} \
+                    --port=${source_port} \
+                    --username=replication \
+                    --pgdata=${PGDATA} \
+                    --format=p \
+                    --no-password \
+                    --label=GEO_ADMIN_CLONE
+      rv=$?
+      [[ ${rv} -ne 0 ]] && error_handler \
+         "${mod} PROC - pg_basebackup failed, clone did NOT succeed!" 1
+   else
+      out "${noexec_msg}"
+   fi
+
+   # ==============================================================================
+   # step 5 restore the config files and restart the instance
+   # ------------------------------------------------------------------------------ 
+   checkmk_info 
+   lmsg="step 5: restoring previously saved configuration files"
+   out "${lmsg}"
+   #r=$(sudo -n /etc/init.d/postgresql-9.1-${target_instance} status | ${redir})
+   #out "${r} returned by pg_ctl status"
+   
+   
+   if [ ${NOEXEC} -eq 0 ]; then
+      r=$(cp -av ${backup_dir}/* ${PGDATA}/ | ${redir})
+      rd_out "${r}; files restored"
+   
+      if [ "${target_instance}" != "${source_instance}" ]; then
+         out "source and target instance are not the same, rebuilding symlinks"
+
+         # symlink ${PGDATA}/pg_xlog to ${PGBASE}/xlog-01
+	 out "Remove old wal files in ${PGWAL}"
+	 rm -rf #{PGWAL}
+         out "symlink ${PGDATA}/pg_wal to ${PGBASE}/walf-01"
+         cp -ar ${PGDATA}/pg_wal/* ${PGBASE}/walf-01
+         mv ${PGDATA}/pg_wal ${PGDATA}/pg_walOLD
+         ln -sf ${PGBASE}/walf-01 ${PGDATA}/pg_wal
+
+	 # Symlink the PG_TBLSPC directory to the data-01 volume 
+	 pg_tblspc=$(ls -1L $PGDATA/pg_tblspc)
+         out "symlink ${PGDATA}/pg_tblspc/${pg_tblspc} to ${PGBASE}/data-01"
+         rm ${PGDATA}/pg_tblspc/${pg_tblspc}
+         ln -sf ${PGBASE}/data-01 ${PGDATA}/pg_tblspc/${pg_tblspc}
+      else
+         out "Target and source instance are the same, OK"
+      fi
+
+      # v1.4.1 - restore server certificate files =================================
+      restore_crts
+      rv=$?
+      [[ ${rv} -ne 0 ]] && crtmsg=$(printf "Error in copying certificate failed: [${rv}]") \
+                        && error_handler "${crtmsg}" 1
+
+      r=$(sudo systemctl start ${sysctl_name})
+      exit_status=$?
+      if [ ${exit_status} -ne 0 ]; then
+         lmsg=$(printf "${ERR50}" ${mod} \ 
+                       "error in starting postgres instance ${target_instance}")
+         error_handler "${lmsg}" 1
+      else
+         out "${r}: (Re)starting PostgreSQL"
+      fi
+
+   else
+      out "${noexec_msg}"
+   fi
+   
+   lmsg="Waiting for the instance ${target_instance} startup..."
+   out "${lmsg}"
+   [[ ${NOEXEC} -eq 0 ]] && sleep ${time2wait}
+
+   r=$(sudo systemctl status ${sysctl_name} | ${redir}) 
+   rd_out "${r}"
+   # ==============================================================================
+   
+fi
+
+# ==============================================================================
+# step 6 post configuration steps: cleaning up unused DB's, authorization and
+# others
+# ------------------------------------------------------------------------------ 
+
+lmsg="step 6: post configuration steps"
+out "${lmsg}"
+   
+if [ ! -z "${DROP_DATABASES}" ]; then
+   drop_databases
+fi
+
+if [ ! -z "${REVOKE_PRIVS}" ]; then
+   revoke_default_privs
+   for role in $(printf "%s\n" ${REVOKE_PRIVS})
+   do
+      revoke_privs ${role}
+   done
+fi
+
+if [ ! -z "${DROP_ROLES}" ]; then
+   drop_roles
+fi
+
+if [ ! -z "${RESET_PASSWORDS}" ]; then
+   for account in $(printf "%s\n" ${RESET_PASSWORDS})
+   do
+      reset_password ${account} 
+   done
+fi
+
+# ==============================================================================
+# step 7 check if clone procxess was succesful (instance is available, 
+# database(s) are dropped etc.
+# ------------------------------------------------------------------------------ 
+if [ ! -z "${DROP_DATABASES}" ]; then
+   db=$(chk_clone "${DROP_DATABASES}")
+   [[ "${db}" == "${DROP_DATABASES}" ]] && out "database [${db}] not removed, check post processing state"
+   [[ "${db}" == "" ]] && out "database [${DROP_DATABASES}] is succesfully removed"
+else
+   out "No database(s) to be dropped."
+fi
+db=$(chk_clone "${DATABASE}")
+[[ "${db}" == "${DATABASE}" ]] && out "database [${db}] is available"
+
+lmsg="Finished: PostgreSQL clone process finished succesfully"
+out "${lmsg}"
+# ==============================================================================
+
+# ====- end of pg_clone =====
