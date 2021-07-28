@@ -3,20 +3,14 @@
     date: Thu Apr  7 12:05:03 CEST 2016
     what: show the 20 largest tablebuffers
 
-    Dependency: ad pg_buffercache extension to the database.
+    Dependency: add pg_buffercache extension to the database.
+
+    #> CREATE EXTENSION pg_buffercache;
+    
 */
 
 -- :: argv none, show the 20 largest tablebuffers
 
-/*
-    file: buffers_per_table.sql
-    date: Thu Apr  7 12:05:03 CEST 2016
-    what: show the 20 largest tablebuffers
-*/
-
--- :: argv none, show the 20 largest tablebuffers
-
-DO $$
 BEGIN
 
    IF NOT EXISTS
