@@ -27,6 +27,7 @@ BEGIN
             )
    THEN
       RAISE NOTICE 'Extension pg_buffercache not created in this database. Please ignore the error message!';
+      RAISE NOTICE 'execute CREATE EXTENSION pg_buffercache; ';
    ELSE
       RAISE NOTICE 'Show the 20 largest tablebuffers';
    END IF ;
