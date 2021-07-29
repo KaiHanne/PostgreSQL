@@ -1,0 +1,341 @@
+#!/bin/bash
+# ==============================================================================
+#
+#     File: sqlcli (AKA sqlsh)
+#     Date: Thu Nov  3 08:10:07 CET 2016
+#     What: SQL shell to use with Oracle, PostgreSQL and later MySQL
+#           It makes extensive use of predefines Sequel scripts which are based 
+#           in the folder structure of sqlsh.
+#
+#      Who: Gert J. Willems ITASSIST
+#
+# Dependencies:
+#    sqlsh is entirely written in bash, see code for details
+#    i.i.g. zijn de volgende scripts noodzakelijk:
+#    - rlwrap
+#    - libbash.sh->generic bash function library
+#    - sqlsh.conf->folder structure, Constants etc.
+#    - sqlsh.cl->rlwrap command completion list
+#  
+# The sqlcli script is wrapped in function sqlsh for prepending the script
+# with the commandline pre-processor 'rlwrap'
+#
+# Synopsis:
+#    Comming soon!
+#
+# Remark for revision 0.1:
+#    Debugging messages are implemented and can be seen when variable 
+#    SCRIPT_DEBUG=1 is set (default = 0) Messages are written to STDERR 
+#    construct:
+#    (
+#       catch_if_debug "<message>"
+#    )
+#    is mainly cosmetic but it isolates the call, take notice that
+#    everything is local between (  ) 
+#
+# ==============================================================================
+# History:
+# Date       Rev   Author        What
+# ---------- ----- ------------- -----------------------------------------------
+# 03-11-2016 0.1   gjwillems     created
+# 08-02-2017 0.2   gjwillems     libbash.sh integration
+# 01-03-2017 0.3   gjwillems     new-script detection added
+# 02-03-2017 0.4   gjwillems     postgres .sql file-detection added
+#            0.5   gjwillems     \<command> option for postgres added
+# 10-08-2017 0.6   gjwillems     build list function added
+# 02-10-2017 0.7   gjwillems     new lib added: libdbcommon.sh with functions
+#                                cut from the vendor specific libs
+# 07-11-2017 0.8   gjwillems     _cli_init_ function added
+# 11-01-2018 1.0.0 gjwillems     partly re-designed command processing 
+# 23-12-2020 1.1.0 gjwillems     accept commandline script and arguments
+#
+# ==============================================================================
+# set -xv
+SC_REV="1.1.0"
+SC_REV_DATE="Wed Dec 23 16:52:53 CET 2020"
+mod=$(basename ${0})
+dynamic_settings=/tmp/.settings.sh
+internalflg=0
+runflg=0
+force=0
+argc=${#}
+_self_=$(which ${mod})
+# rlwrap support met de alias brmoctls (libbrmo.sh)
+# rlwrap="rlwrap -D 1 -i -H $HOME/bin/.${mod}_history"
+quiet=0 # i.e. verbose = true
+dprompt="${mod}"
+date_prompt=0
+sqlsh=1
+sqlcmd=1  # sequel command defaults to false
+isscript=1
+
+source ${GLOBAL_LIB}/libbash.sh
+source ${GLOBAL_LIB}/libpostgres.sh
+source ${GLOBAL_LIB}/libdbcommon.sh
+
+arglist=( ${@}  )
+
+# ==============================================================================
+# Version function
+# ------------------------------------------------------------------------------
+function version {
+   mode=""
+   [[ ${sqlsh} -eq 1 ]] && mode=" Shell Mode"
+   printf "%s%s Version %s build %s\n" "${mod}" "${mode}" "${SC_REV}" \
+                                       "${SC_REV_DATE}"
+}
+
+# ==============================================================================
+# Version _cli_init_
+# ------------------------------------------------------------------------------
+function _cli_init_ {
+   [[ ! -L ${GLOBAL_LIB} ]] && set_sqldir
+}
+
+# ==============================================================================
+# set a specific oracle SID or Postgres DB
+# ------------------------------------------------------------------------------
+function setdb {
+   local _fname_=${FUNCNAME[0]}
+   DB=${1}
+
+   [[ ${DB_VENDOR} == "oracle" ]] && sid ${DB} && return 0
+
+   return 1
+}
+
+# ==============================================================================
+# geeft een overzicht van de commandoset / functies in sqlcli
+# ------------------------------------------------------------------------------
+function command {
+   local _fname_=${FUNCNAME[0]}
+   (
+      if [[ -s $(which ${mod}) ]]; then
+         printf "\n${mod} ${rev} commando set:\n\n"
+         cat $(which $mod) | grep "^function" | cut -d ' ' -f 2| sort
+         echo
+      else
+         printf "$mod: kan ${mod} niet openen in huidige locatie\n"
+      fi
+   )
+   (
+      catch_if_debug "interne functie voor het tonen van alle lokale functies"
+   )
+   exit 0
+}
+
+# ==============================================================================
+# is command a psql command
+# ------------------------------------------------------------------------------
+function ispgcmd {
+   fg=${1}
+   [[ ${fg} == '\' ]] && true && return
+   false && return
+}
+
+# ==============================================================================
+# PostgreSQL psql 
+# ------------------------------------------------------------------------------
+function postsql {
+#set -xv
+   tobeexecuted=(${@})
+   local _fname_=${FUNCNAME[0]}
+
+   cmd="\\i"
+
+   ispgcmd "${tobeexecuted[0]:0:1}"
+   ispgc=$?
+   (
+      catch_if_debug "${_fname_}: ispg command = [${ispgc}]"
+      catch_if_debug "${_fname_}: command = [${tobeexecuted}]"
+   )
+
+   if [ ${ispgc} -eq 1 ]; then
+      script=${GLOBAL_SQL}/${tobeexecuted[0]}.sql
+      scriptvar1=${tobeexecuted[1]:-%}
+      scriptvar2=${tobeexecuted[2]:-%}
+      scriptvar3=${tobeexecuted[3]:-%}
+   else
+      cmd=""
+      script=${tobeexecuted[0]}
+   fi
+   # remove the 1st element from the array
+   #tobeexecuted=(${tobeexecuted[@]:1})
+   (
+      catch_if_debug "${_fname_}: first character of command: [${tobeexecuted[0]:0:1}]" 
+      [[ ${isscript} -eq 0 ]] && catch_if_debug "${_fname_}: exec script: ${script}" && catch_if_debug "${_fname_}: sv1=[${scriptvar1}] sv2=[${scriptvar2}]"
+      [[ ${sqlcmd}   -eq 0 ]] && catch_if_debug "${_fname_}: exec SQL command: ${tobeexecuted}"
+   )
+
+   if [ ${sqlcmd} -eq 0 ]; then
+      psql ${database:-postgres} << EOP
+      ${tobeexecuted[@]};
+EOP
+   else
+      psql ${database:-postgres} \
+           -v VAR1=${scriptvar1} \
+           -v VAR2=${scriptvar2} \
+           -v VAR3=${scriptvar3} << EOP
+      ${cmd} ${script} 
+EOP
+   fi
+
+return 0
+}
+
+# ==============================================================================
+# set SQL directory to PostgreSQL version dir
+# ------------------------------------------------------------------------------
+function set_sqldir() {
+   sqldir=${GLOBAL_HOME}/sql-$(pgversion -s) 
+   # echo sqldir=[${sqldir}]
+   [[ ! -L ${GLOBAL_SQL} ]] && ln -sf ${sqldir} ${GLOBAL_SQL}
+}
+
+# ==============================================================================
+# rebuild the ccl file for list command 
+# ------------------------------------------------------------------------------
+function build_list_obsolete () {
+   local _fname_=${FUNCNAME[0]}
+   local _quiet_=${1:-0} 
+
+   set_sqldir
+   cp ${ccl_file} ${ccl_file}.$$
+   _init_cli_ > ${ccl_file} 
+   [[ ${_quiet_} -eq 1 ]] && \
+   out "${_fname_} - Command completion file (re)build, backup in [${ccl_file}.$$]"
+
+   return 0
+}
+
+# ==============================================================================
+# SQL Shell invocation 
+# ------------------------------------------------------------------------------
+function sequelshell {
+   local _fname_=${FUNCNAME[0]}
+
+   # disable * wildcard expansion
+   set -f
+
+   build_list 1
+
+   [[ ! -z ${DB_VENDOR} ]] && printf "${DB_VENDOR} database detected, use list to see the available command set\n"
+   
+   while [ 1 ]
+   do
+      trap 'sigquit' HUP
+      trap 'sigquit' INT
+         _shell_settings_ 
+         printf "${prompt}"
+         read -a command
+         st=$?
+         [[ ${command} == "quit" ]] && exit 0
+         # EOT/EOF found
+         [[ ${st} -eq 1 ]] && exit 0
+ 
+         ispgcmd ${command[0]:0:1} 
+         rv=$?
+         (
+            catch_if_debug "${_fname_}() is psql intenal command: [${rv/1/false} ${rv/0/true}]"
+         )
+
+         # Check quietly if the specified command is in the command completion
+         # list for the current selected database vendor
+         grep -qiw "^${command[0]:-void}" ${ccl_file}
+         grep_rv=$?
+         if [[ ${grep_rv} -eq 1 && ${rv} -eq 1 ]]; then
+            isscript=1
+            set -f
+            cmd=$(upper ${command[0]})
+            (
+		catch_if_debug "${_fname_}: CASE; check on sql command [${cmd}]"
+            )
+            case ${cmd}
+            in
+               DROP|\
+               SHOW|\
+               DESC|\
+               SELECT|\
+               UPDATE|\
+               DELETE|\
+               INSERT|\
+               CREATE|\
+               GRANT|\
+               ALTER) sqlcmd=0
+                      [[ -z ${timing} ]] && postsql ${command[@]}
+                      [[ ! -z ${timing} ]] && time postsql ${command[@]}
+                      ;;
+               \?|*) sqlcmd=1;;
+            esac
+            (
+		catch_if_debug "${_fname_}: CASE; sql command = ${sqlcmd/0/true} ${sqlcmd/1/false}"
+            )
+
+            [[ ${sqlcmd} -eq 1 ]] && set +f && eval ${command[@]:-"void"}
+
+         elif [[ ${grep_rv} -eq 0 ]]; then
+            isscript=0
+            postsql ${command[@]} 
+         elif [[ ${ispgcmd} -eq 0 ]]; then
+            postsql ${command[@]} 
+         fi
+       
+         (
+            tracemsg="${_fname_}()->EXEC ${command[@]}"
+            [[ ! -z ${command} ]] && catch_if_debug "${tracemsg}"
+         )
+
+         [[ -s ${dynamic_settings} ]] && source ${dynamic_settings} && rm -f ${dynamic_settings}
+   done
+}
+
+# ==============================================================================
+# Command line parsing
+while getopts "fIst:Vh" argv
+do
+   (
+      catch_if_debug "parser::while loop => argc:[${argc}] argv:[${*}]"
+   )
+   case ${argv}
+   in
+      # ========================================================================
+      # Generic: specified command is in the last argument in call to $0
+      # thus always positional! therefore we MUST substract 1 from argc
+      # to prevent the specified command dropping from the list
+      # ========================================================================
+      V) version && exit 0 ;;
+      h) usage ;;
+      I) # Internal command / command parameter
+         parameter=${OPTARG}
+         ((argc-=1))
+         shift ${argc}
+         internalflg=1 ;;
+      f) # Forcae flag: bijvoorbeeld om geforceeerd een run te starten
+         # zonder dat er gecontroleerd wordt of er nieuwe berichten zijn
+         ((argc-=1))
+         shift ${argc}
+         force=1 ;;
+      s) # interactieve shell
+         sequelsh=1 ;;
+      t) # DB Vensdot type: oracle, postgres etc.
+         ((argc-=1))
+         shift ${argc}
+         export DB_VENDOR=$(lower "${OPTARG}")
+         export UDB_VENDOR=$(upper ${DB_VENDOR}) ;;
+   esac
+done
+
+# ====== main scope ============================================================
+_cli_init_
+version
+# echo config_file=[${config_file}]
+# echo cc_file=[${cc_file}]
+
+if [ -z ${arglist} ]; then
+   sequelshell 
+else
+   postsql ${arglist[*]} 
+fi
+
+# ====== end of sqlcli =========================================================
+
