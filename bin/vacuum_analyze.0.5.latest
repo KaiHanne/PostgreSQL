@@ -1,0 +1,109 @@
+#!/bin/bash
+# ==============================================================================
+#
+#      File: vacuum_analyze
+#      Date: Thu May  6 07:38:24 CEST 2021
+#      What: conditional vacuum (full) and update statistics
+#
+#       Who: Gert J. Willems
+#
+# Dependencies:
+#    - libbash.sh->generic bash function library
+#
+# Synopsis:
+#    Vacuum and analyze (verbose) all tables that aren's done recently
+#
+# ==============================================================================
+# History:
+# Date       Rev   Author        What
+# ---------- ----- ------------- -----------------------------------------------
+# 06-05-2021 0.1   gjwillems     created
+# 06-05-2021 0.2   gjwillems     header and usage added
+# 11-05-2021 0.3   gjwillems     only vacuum/analyze the ones that aren't done
+# 07-07-2021 0.4   gjwillems     FULL -F switch added
+# 27-07-2021 0.5   gjwillems     Sequel code incorporatied in script
+#
+# ==============================================================================
+# set -xv
+#
+mod=$(basename ${0})
+rev="0.5"
+rev_date="Tue Jul 27 12:56:05 CEST 2021"
+
+NOEXEC=0
+ANALYZE_OPT=
+TMPSQL='/tmp/va.sql'
+
+# ==============================================================================
+# Vacuum Analyze specified database
+# ------------------------------------------------------------------------------ 
+function va() {
+    dbname=${1}
+    aopt=${2}  
+
+    _query="SELECT 'VACUUM VERBOSE ${aopt} ANALYZE '|| nspname ||'.'|| relname ||';' 
+            FROM ( 
+               SELECT nspname
+               ,      relname
+               ,      GREATEST(pg_stat_get_last_vacuum_time(c.oid),pg_stat_get_last_autovacuum_time(c.oid)) AS v 
+               ,      GREATEST(pg_stat_get_last_analyze_time(c.oid), pg_stat_get_last_autoanalyze_time(c.oid)) AS g 
+               FROM   pg_class c, pg_namespace n 
+               WHERE  relkind = 'r' 
+               AND    n.oid = c.relnamespace 
+               AND    n.nspname <> 'information_schema' 
+               AND    n.nspname not like 'pg_temp_%' ORDER BY 3) AS foo 
+            WHERE v IS NULL;"
+
+    psql -q -t -A ${dbname} > ${TMPSQL} << EOS
+    $_query;
+EOS
+    psql ${dbname} -q -f ${TMPSQL}
+
+    lines=$(cat ${TMPSQL} | wc -l)
+
+    if [ ${lines} -lt 2 ]; then
+       printf "${mod} - INFO No tables need VACUUM or ANALYZE\n"
+       return 1
+    fi
+
+    rm -f ${TMPSQL}
+  
+    return 0
+}
+
+# ==============================================================================
+# Parser
+# ------------------------------------------------------------------------------ 
+while getopts "nhF" argv
+do
+    case ${argv}
+    in
+       n) NOEXEC=1 ;;
+       F) ANALYZE_OPT="FULL" ;;
+       h) printf "\n${mod} - ${rev} Vacuum and analyze database(s)\n"
+          printf "usage: ${mod} [-h|-n]\n"
+          printf "       -n noexec, just list the databases\n"
+          printf "       -F FULL, perform a full vacuum \n"
+          printf "       -h help, this text\n\n"
+          exit 1 ;;
+    esac
+done
+
+# =============================== main scope ===================================
+statement="SELECT datname 
+FROM pg_database 
+WHERE datdba <> 10 
+AND   datconnlimit <> 0
+AND   datallowconn = true
+ORDER BY 1"
+
+for DB in $(psql -A -t -c "${statement}")
+do
+    if [ ${NOEXEC} -eq 1 ]; then
+       printf "${mod} - INFO NOEXEC database: ${DB}\n"
+    else
+       printf "${mod} - INFO VACUUM and ANALYZE ${DB}\n"
+       va "${DB}" "${ANALYZE_OPT}"
+    fi
+done
+# ========================== end of vacuum_analyze =============================
